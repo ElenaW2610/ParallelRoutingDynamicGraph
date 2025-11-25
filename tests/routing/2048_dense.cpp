@@ -103,6 +103,8 @@ int main(int argc, char** argv) {
         cout << "Mode: partitioned min_cost_routing_partitioned\n";
     else if (cfg.mode == 'e')
         cout << "Mode: edge-parallel min_cost_routing_edge_parallel\n";
+    else if (cfg.mode == 'a')
+        cout << "Mode: auto-adjust min_cost_routing_auto\n";
     else
         cout << "Mode: original min_cost_routing\n";
     // build graph
@@ -145,6 +147,8 @@ int main(int argc, char** argv) {
         paths = g.min_cost_routing_partitioned(pairs, &arrival_time, cfg.max_steps);
     } else if (cfg.mode == 'e') {
         paths = g.min_cost_routing_edge_parallel(pairs, &arrival_time, cfg.max_steps);
+    } else if (cfg.mode == 'a') {
+        paths = g.min_cost_routing_auto(pairs, &arrival_time, cfg.max_steps);
     } else {
         paths = g.min_cost_routing(pairs, &arrival_time, cfg.max_steps);
     }

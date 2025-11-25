@@ -1,5 +1,6 @@
 #include "dynamicgraph.h"
 
+#include <iostream>
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -311,7 +312,7 @@ DynamicGraph::min_cost_routing(const std::vector<std::pair<Vertex, Vertex>>& pai
 }
 
 std::vector<std::vector<DynamicGraph::Vertex>>
-DynamicGraph::min_cost_routing_partitioned( const std::vector<std::pair<Vertex, Vertex>>& pairs, std::vector<int>* arrival_time, int max_steps) const
+DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, Vertex>>& pairs, std::vector<int>* arrival_time, int max_steps) const
 {
     const auto &G = snapshot_adj_.empty() ? adj_ : snapshot_adj_;
     std::size_t n = G.size();
@@ -321,7 +322,7 @@ DynamicGraph::min_cost_routing_partitioned( const std::vector<std::pair<Vertex, 
     if (P == 0)
         return {};
 
-    //group by destination and build dist_to_dest[d][v] via BFS
+    // precompute distances via BFS
     std::unordered_map<Vertex, int> dest_index;
     std::vector<Vertex> dest_list;
     dest_list.reserve(P);
@@ -340,9 +341,8 @@ DynamicGraph::min_cost_routing_partitioned( const std::vector<std::pair<Vertex, 
     int D = static_cast<int>(dest_list.size());
     std::vector<std::vector<int>> dist_to_dest(D, std::vector<int>(n, INF));
 
-    // Parallel over distinct destinations
     #pragma omp parallel for schedule(dynamic)
-    for (int k = 0; k < D; k++) {
+    for (int k=0; k < D; k++) {
         Vertex dest = dest_list[k];
         auto &dist = dist_to_dest[k];
 
@@ -375,17 +375,24 @@ DynamicGraph::min_cost_routing_partitioned( const std::vector<std::pair<Vertex, 
         return dist_to_dest[idx][v];
     };
 
-    //initialize package state
+    // initialize package states
     std::vector<Vertex> pos(P);
     std::vector<Vertex> dst(P);
     std::vector<bool> done(P, false);
     std::vector<std::vector<Vertex>> paths(P);
 
+    if (arrival_time)
+        arrival_time->assign(P, -1);
+
     for (int i = 0; i < P; i++) {
         Vertex s = pairs[i].first;
         Vertex d = pairs[i].second;
 
-        if (s < 0 || d < 0 || static_cast<std::size_t>(s) >= n || static_cast<std::size_t>(d) >= n || !active_[s] || !active_[d]) {
+        if (s < 0 || d < 0 ||
+            static_cast<std::size_t>(s) >= n ||
+            static_cast<std::size_t>(d) >= n ||
+            !active_[s] || !active_[d]) {
+
             done[i] = true;
             if (arrival_time)
                 (*arrival_time)[i] = -1;
@@ -414,50 +421,51 @@ DynamicGraph::min_cost_routing_partitioned( const std::vector<std::pair<Vertex, 
 
     std::vector<Vertex> next_pos(P);
 
-    // partition vertices into subgraphs by round-robin
+    // partition vertices into subgraphs (round-robin)
     int T = omp_get_max_threads();
-    if (T <= 0) 
+    if (T <= 0)
         T = 1;
+
     auto vertex_partition = [T](Vertex v) -> int {
         return static_cast<int>(v % T);
     };
 
-    // Assign initial packets to partitions by their starting positions
     std::vector<std::vector<int>> local_pkgs(T);
-    for (int i = 0; i < P; i++) {
-        if (done[i]) continue;
+    for (int i=0; i < P; i++) {
+        if (done[i]) 
+            continue;
         int p_id = vertex_partition(pos[i]);
         local_pkgs[p_id].push_back(i);
     }
 
+    // outgoing[src_thread][dst_thread] = list of package indices
     std::vector<std::vector<std::vector<int>>> thread_outgoing(
-        T, std::vector<std::vector<int>>(T)
-    );
+        T, std::vector<std::vector<int>>(T));
 
-    //simulation loop
+    // reserve to reduce reallocations
+    int approx_per_thread = std::max(1, P / T);
+    for (int t=0; t < T; t++) {
+        local_pkgs[t].reserve(approx_per_thread * 2);
+        for (int u=0; u < T; u++)
+            thread_outgoing[t][u].reserve(approx_per_thread);
+    }
+
+    // simulation
     for (int t_step = 0; t_step < max_steps && undelivered > 0; t_step++) {
-
-        // Clear outgoing buffers
-        for (int tid = 0; tid < T; tid++) {
-            for (int p = 0; p < T; p++) {
-                thread_outgoing[tid][p].clear();
-            }
-        }
-
-        // Parallel region: each thread works on its own partition
         #pragma omp parallel num_threads(T)
         {
             int tid = omp_get_thread_num();
             auto &pkgs = local_pkgs[tid];
+            auto &out_row = thread_outgoing[tid];
 
-            // Local edge-capacity map for this partition
             std::unordered_map<std::uint64_t, int> edge_owner;
-            edge_owner.reserve(2 * pkgs.size());
+            edge_owner.reserve(2*pkgs.size() + 1);
 
-            std::vector<bool>   local_can_move(pkgs.size(), false);
+            std::vector<bool> local_can_move(pkgs.size(), false);
             std::vector<Vertex> desired_next_local(pkgs.size(), -1);
 
-            //decide desired next hop for local packages
+            int local_undelivered = 0;
+            // decide desired next hop and capacity resolution
             for (std::size_t idx = 0; idx < pkgs.size(); idx++) {
                 int i = pkgs[idx];
                 if (done[i]) {
@@ -471,45 +479,35 @@ DynamicGraph::min_cost_routing_partitioned( const std::vector<std::pair<Vertex, 
                 int best_dist = get_dist(u, d);
                 Vertex best_v = u;
 
-                if (best_dist == INF) {
-                    desired_next_local[idx] = u;
-                    continue;
-                }
-
-                for (const Edge &e : G[u]) {
-                    Vertex v = e.to;
-                    if (!active_[v]) continue;
-                    int dv = get_dist(v, d);
-                    if (dv < best_dist) {
-                        best_dist = dv;
-                        best_v = v;
+                if (best_dist != INF) {
+                    for (const Edge &e : G[u]) {
+                        Vertex v = e.to;
+                        if (!active_[v]) 
+                            continue;
+                        int dv = get_dist(v, d);
+                        if (dv < best_dist) {
+                            best_dist = dv;
+                            best_v = v;
+                        }
                     }
                 }
 
                 desired_next_local[idx] = best_v;
-            }
-
-            // capacity resolution for edges whose source is in this partition
-            for (std::size_t idx = 0; idx < pkgs.size(); idx++) {
-                int i = pkgs[idx];
-                if (done[i]) continue;
-
-                Vertex u = pos[i];
-                Vertex v = desired_next_local[idx];
-
-                if (v == u || v < 0) continue;
-
-                std::uint64_t key = pack_edge_key(u, v);
-                auto it = edge_owner.find(key);
-                if (it == edge_owner.end()) {
-                    edge_owner.emplace(key, i);
-                    local_can_move[idx] = true;
-                } else {
-                    local_can_move[idx] = false;
+                // capacity resolution for edges whose sources are in this partition
+                if (!done[i]) {
+                    Vertex v = best_v;
+                    if (v != u && v >= 0) {
+                        std::uint64_t key = pack_edge_key(u, v);
+                        auto it = edge_owner.find(key);
+                        if (it == edge_owner.end()) {
+                            edge_owner.emplace(key, i);
+                            local_can_move[idx] = true;
+                        }
+                    }
                 }
             }
 
-            // commit move, update arrival times, and enqueue packets for next partitions
+            // commit moves, update arrival times, and enqueue to outgoing
             for (std::size_t idx = 0; idx < pkgs.size(); idx++) {
                 int i = pkgs[idx];
 
@@ -520,12 +518,11 @@ DynamicGraph::min_cost_routing_partitioned( const std::vector<std::pair<Vertex, 
 
                 if (local_can_move[idx]) {
                     next_pos[i] = desired_next_local[idx];
-                    if (paths[i].empty() || paths[i].back() != next_pos[i]) {
+                    if (paths[i].empty() || paths[i].back() != next_pos[i])
                         paths[i].push_back(next_pos[i]);
-                    }
-                } else {
+                } 
+                else
                     next_pos[i] = pos[i];
-                }
 
                 if (next_pos[i] == dst[i]) {
                     done[i] = true;
@@ -533,38 +530,47 @@ DynamicGraph::min_cost_routing_partitioned( const std::vector<std::pair<Vertex, 
                         (*arrival_time)[i] = t_step + 1;
                 }
 
-                // If still not done, assign to the partition that owns its new vertex
                 if (!done[i]) {
                     int next_part = vertex_partition(next_pos[i]);
-                    thread_outgoing[tid][next_part].push_back(i);
+                    out_row[next_part].push_back(i);
+                    local_undelivered++;
                 }
             }
-        } // end parallel region
 
-        // Swap positions for next timestep
-        pos.swap(next_pos);
-        // each thread pulls its own incoming mail
-        #pragma omp parallel num_threads(T)
-        {
-            int tid = omp_get_thread_num();
-            local_pkgs[tid].clear();
+            // synchronize so all next_pos and outgoing are written
+            #pragma omp barrier
+
+            // single thread swaps pos / next_pos and resets global undelivered
+            #pragma omp single
+            {
+                pos.swap(next_pos);
+                undelivered = 0;
+            }
+
+            // each thread contributes its local_undelivered
+            #pragma omp atomic
+            undelivered += local_undelivered;
+
+            // ensure undelivered is fully updated before continuing to next step
+            #pragma omp barrier
+
+            // rebuild local_pkgs[tid] from incoming messages
+            pkgs.clear();
             for (int src=0; src < T; src++) {
                 auto &incoming = thread_outgoing[src][tid];
                 if (!incoming.empty())
-                    local_pkgs[tid].insert(local_pkgs[tid].end(), incoming.begin(), incoming.end());
+                    pkgs.insert(pkgs.end(), incoming.begin(), incoming.end());
             }
 
-            // synchronize so everyone has finished reading from thread_outgoing
+            // barrier so everyone has finished reading from thread_outgoing
             #pragma omp barrier
-            for (int dst=0; dst < T; dst++) // each thread clears their own outgoing buffers
-                thread_outgoing[tid][dst].clear();
-        }
 
-        // recompute undelivered
-        undelivered = 0;
-        for (int i=0; i < P; i++) {
-            if (!done[i])
-                undelivered++;
+            // each thread to clear its own outgoing row
+            for (int dst=0; dst < T; dst++)
+                thread_outgoing[tid][dst].clear();
+
+            // final barrier before next timestep
+            #pragma omp barrier
         }
     }
 
@@ -815,6 +821,86 @@ DynamicGraph::min_cost_routing_edge_parallel(const std::vector<std::pair<Vertex,
     return paths;
 }
 
+std::vector<std::vector<DynamicGraph::Vertex>>
+DynamicGraph::min_cost_routing_auto(const std::vector<std::pair<Vertex, Vertex>>& pairs, std::vector<int>* arrival_time, int max_steps) const
+{
+    const auto &G = snapshot_adj_.empty() ? adj_ : snapshot_adj_;
+    std::size_t n = G.size();
+    int P = static_cast<int>(pairs.size());
+
+    if (arrival_time)
+        arrival_time->assign(P, -1);
+
+    if (P == 0)
+        return {};
+
+    int T = omp_get_max_threads();
+
+    long long directed_edges = 0;
+    for (std::size_t v=0; v < n; v++) {
+        if (!active_[v]) 
+            continue;
+        directed_edges += static_cast<long long>(G[v].size());
+    }
+    long long E = directed_edges / 2;
+
+    if (E == 0)
+        return min_cost_routing_edge_parallel(pairs, arrival_time, max_steps);
+
+    double avg_deg = directed_edges / static_cast<double>(n); // 2E / N
+    double rho = static_cast<double>(P) / static_cast<double>(E);  // pkgs per edge
+    double rho_eff = rho * T; // pkgs per edge per thread
+
+    // dynamic congestion estimate at sources; sample up to 1000 packages
+    int sample = std::min(P, 1000);
+    long long total_deg = 0;
+    int used = 0;
+    if (sample > 0) {
+        int stride = std::max(1, P / sample);
+        for (int k=0, idx=0; k < sample && idx < P; k++, idx += stride) {
+            Vertex u = pairs[idx].first;
+            Vertex d = pairs[idx].second;
+            if (u == d) 
+                continue;
+            if (u < 0 || static_cast<std::size_t>(u) >= n) 
+                continue;
+            if (!active_[u]) 
+                continue;
+            total_deg += static_cast<int>(G[u].size());
+            used++;
+        }
+    }
+
+    // capacity per package ~ average outgoing degree of vertices where packages live
+    double capacity_per_pkg = (used > 0) ? (static_cast<double>(total_deg) / used) : avg_deg;
+
+    // heuristic decision between partitioned and edge-parallel
+    const double SPARSE_DEGREE_THRESH = 8.0; // very sparse
+    const double DENSE_DEGREE_THRESH = 512.0; // very dense
+    const double LOW_LOAD_PER_EDGE_THREAD = 0.05; // low contention
+    const double FUNNEL_CAPACITY_PER_PKG = 2.0; // funnel
+
+    bool use_partitioned = false;
+    if (avg_deg <= SPARSE_DEGREE_THRESH) // line / tree-like
+        use_partitioned = false;
+    else {
+        bool funnel_like = (capacity_per_pkg < FUNNEL_CAPACITY_PER_PKG);
+        bool moderate_load = (rho_eff >= LOW_LOAD_PER_EDGE_THREAD);
+        if (funnel_like && moderate_load)
+            use_partitioned = true;
+        else if (avg_deg >= DENSE_DEGREE_THRESH && moderate_load)
+            use_partitioned = true;
+        else
+            use_partitioned = false;
+    }
+
+    if (use_partitioned) {
+        std::cout << "Use graph partition scheme\n" << std::flush;
+        return min_cost_routing_partitioned(pairs, arrival_time, max_steps);
+    }
+    std::cout << "Use edge parallel scheme\n" << std::flush;
+    return min_cost_routing_edge_parallel(pairs, arrival_time, max_steps);
+}
 
 // K-cores (parallel with static scheduling)
 std::vector<int> DynamicGraph::k_core(int k) const {

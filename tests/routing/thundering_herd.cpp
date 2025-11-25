@@ -47,7 +47,6 @@ bool edge_exists(const DynamicGraph& g, int u, int v) {
     return false;
 }
 
-// Basic structural check: paths follow edges / stay-put and aren't too long.
 bool check_routing_correctness(const DynamicGraph& g,
                                const std::vector<std::pair<int,int>>& pairs,
                                const std::vector<std::vector<int>>& paths,
@@ -105,6 +104,8 @@ int main(int argc, char** argv) {
         cout << "Mode: partitioned min_cost_routing_partitioned\n";
     else if (cfg.mode == 'e')
         cout << "Mode: edge-parallel min_cost_routing_edge_parallel\n";
+    else if (cfg.mode == 'a')
+        cout << "Mode: auto-adjust min_cost_routing_auto\n";
     else
         cout << "Mode: original min_cost_routing\n";
 
@@ -150,6 +151,8 @@ int main(int argc, char** argv) {
         paths = g.min_cost_routing_partitioned(pairs, &arrival_time, cfg.max_steps);
     } else if (cfg.mode == 'e') {
         paths = g.min_cost_routing_edge_parallel(pairs, &arrival_time, cfg.max_steps);
+    } else if (cfg.mode == 'a') {
+        paths = g.min_cost_routing_auto(pairs, &arrival_time, cfg.max_steps);
     } else {
         paths = g.min_cost_routing(pairs, &arrival_time, cfg.max_steps);
     }
