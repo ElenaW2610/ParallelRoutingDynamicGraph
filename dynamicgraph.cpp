@@ -13,6 +13,14 @@
 
 #include <omp.h>
 
+struct PackageState {
+    DynamicGraph::Vertex pos; // current position (4 bytes)
+    DynamicGraph::Vertex dst; // destination (4 bytes)
+    int dest_idx; // row index into dist_to_dest (4 bytes)
+    uint8_t done; // (1 byte)
+    uint8_t _pad[3]; // pad another 3 bytes
+}; // total 16 bytes
+
 DynamicGraph::DynamicGraph(std::size_t num_vertices)
     : adj_(num_vertices),
       snapshot_adj_(),
@@ -24,7 +32,6 @@ check_vertex(const DynamicGraph::Vertex v, std::size_t n) {
 }
 
 // Dynamic Updates
-
 void DynamicGraph::add_vertex(Vertex v) {
     if (v < 0) 
         return;
@@ -78,11 +85,9 @@ void DynamicGraph::remove_edge(Vertex u, Vertex v) {
     );
 }
 
-
 std::vector<DynamicGraph::Vertex> DynamicGraph::neighbors(Vertex v) const {
     const auto& G = snapshot_adj_.empty() ? adj_ : snapshot_adj_;
     check_vertex(v, G.size());
-
     std::vector<Vertex> out;
     out.reserve(G[v].size());
     for (const Edge& e : G[v]) {
@@ -92,11 +97,9 @@ std::vector<DynamicGraph::Vertex> DynamicGraph::neighbors(Vertex v) const {
     return out;
 }
 
-
 // Snapshots
 void DynamicGraph::snapshot() {
     snapshot_adj_ = adj_;
-
     for (std::size_t v=0; v < snapshot_adj_.size(); v++) {
         if (!active_[v])
             snapshot_adj_[v].clear();
@@ -375,43 +378,40 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
         }
     }
 
-    // precompute destination index per package
-    std::vector<int> pkg_dest_idx(P, -1);
-    for (int i=0; i < P; i++) {
-        Vertex d = pairs[i].second;
-        auto it = dest_index.find(d);
-        if (it != dest_index.end())
-            pkg_dest_idx[i] = it->second;
-        else
-            pkg_dest_idx[i] = -1; // unreachable
-    }
-
-    // initialize package states
-    std::vector<Vertex> pos(P);
-    std::vector<Vertex> dst(P);
-    std::vector<uint8_t> done(P, false);
+    // initialize package states in a single array
+    std::vector<PackageState> pkg_states(P);
     std::vector<std::vector<Vertex>> paths(P);
 
     if (arrival_time)
         arrival_time->assign(P, -1);
-
+    
     for (int i=0; i < P; i++) {
         Vertex s = pairs[i].first;
         Vertex d = pairs[i].second;
-
+    
+        pkg_states[i].dst = d;
+        pkg_states[i].done = 0;
+    
+        // map destination to BFS row
+        auto it = dest_index.find(d);
+        if (it != dest_index.end())
+            pkg_states[i].dest_idx = it->second;
+        else
+            pkg_states[i].dest_idx = -1;
+    
+        // invalid or inactive endpoints
         if (s < 0 || d < 0 || static_cast<std::size_t>(s) >= n || static_cast<std::size_t>(d) >= n || !active_[s] || !active_[d]) {
-            done[i] = 1;
+            pkg_states[i].done = 1;
             if (arrival_time)
                 (*arrival_time)[i] = -1;
             continue;
         }
-
-        pos[i] = s;
-        dst[i] = d;
+    
+        pkg_states[i].pos = s;
         paths[i].push_back(s);
-
+    
         if (s == d) {
-            done[i] = 1;
+            pkg_states[i].done = 1;
             if (arrival_time)
                 (*arrival_time)[i] = 0;
         }
@@ -419,7 +419,7 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
 
     int undelivered = 0;
     for (int i=0; i < P; i++) {
-        if (!done[i])
+        if (!pkg_states[i].done)
             undelivered++;
     }
 
@@ -439,9 +439,9 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
 
     std::vector<std::vector<int>> local_pkgs(T);
     for (int i=0; i < P; i++) {
-        if (done[i]) 
+        if (pkg_states[i].done) 
             continue;
-        int p_id = vertex_partition(pos[i]);
+        int p_id = vertex_partition(pkg_states[i].pos);
         local_pkgs[p_id].push_back(i);
     }
 
@@ -462,27 +462,28 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
         #pragma omp parallel num_threads(T)
         {
             int tid = omp_get_thread_num();
-            auto &pkgs = local_pkgs[tid];
+            auto &local_ids = local_pkgs[tid];
             auto &out_row = thread_outgoing[tid];
 
             std::unordered_map<std::uint64_t, int> edge_owner;
-            edge_owner.reserve(2*pkgs.size() + 1);
+            edge_owner.reserve(2*local_ids.size() + 1);
 
-            std::vector<uint8_t> local_can_move(pkgs.size(), false);
-            std::vector<Vertex> desired_next_local(pkgs.size(), -1);
+            std::vector<uint8_t> local_can_move(local_ids.size(), 0);
+            std::vector<Vertex> desired_next_local(local_ids.size(), -1);
 
             int local_undelivered = 0;
             // decide desired next hop and capacity resolution
-            for (std::size_t idx = 0; idx < pkgs.size(); idx++) {
-                int i = pkgs[idx];
-                if (done[i]) {
-                    desired_next_local[idx] = pos[i];
+            for (std::size_t idx = 0; idx < local_ids.size(); idx++) {
+                int i = local_ids[idx];
+                PackageState &p = pkg_states[i];
+
+                if (p.done) {
+                    desired_next_local[idx] = p.pos;
                     continue;
                 }
 
-                Vertex u = pos[i];
-                int d_idx = pkg_dest_idx[i];
-
+                Vertex u = p.pos;
+                int d_idx = p.dest_idx;
                 Vertex best_v = u;
                 int best_dist;
 
@@ -492,7 +493,6 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
                 }
 
                 best_dist = dist_to_dest[d_idx][u];
-
                 if (best_dist != INF) {
                     for (const Edge &e : G[u]) {
                         Vertex v = e.to;
@@ -501,15 +501,14 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
                         int dv = dist_to_dest[d_idx][v];
                         if (dv < best_dist) {
                             best_dist = dv;
-                            best_v = v;
+                            best_v    = v;
                         }
                     }
                 }
 
                 desired_next_local[idx] = best_v;
-
                 // capacity resolution for edges whose sources are in this partition
-                if (!done[i]) {
+                if (!p.done) {
                     Vertex v = best_v;
                     if (v != u && v >= 0) {
                         std::uint64_t key = pack_edge_key(u, v);
@@ -523,11 +522,12 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
             }
 
             // commit moves, update arrival times, and enqueue to outgoing
-            for (std::size_t idx = 0; idx < pkgs.size(); idx++) {
-                int i = pkgs[idx];
+            for (std::size_t idx = 0; idx < local_ids.size(); idx++) {
+                int i = local_ids[idx];
+                PackageState &p = pkg_states[i];
 
-                if (done[i]) {
-                    next_pos[i] = pos[i];
+                if (p.done) {
+                    next_pos[i] = p.pos;
                     continue;
                 }
 
@@ -537,15 +537,15 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
                         paths[i].push_back(next_pos[i]);
                 } 
                 else
-                    next_pos[i] = pos[i];
+                    next_pos[i] = p.pos;
 
-                if (next_pos[i] == dst[i]) {
-                    done[i] = 1;
+                if (next_pos[i] == p.dst) {
+                    p.done = 1;
                     if (arrival_time)
-                        (*arrival_time)[i] = t_step + 1;
+                        (*arrival_time)[i] = t_step+1;
                 }
 
-                if (!done[i]) {
+                if (!p.done) {
                     int next_part = vertex_partition(next_pos[i]);
                     out_row[next_part].push_back(i);
                     local_undelivered++;
@@ -554,10 +554,15 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
             // synchronize so all next_pos and outgoing are written
             #pragma omp barrier
 
-            // single thread swaps pos / next_pos and resets global undelivered
+            // update pkg_states[i].pos from next_pos in parallel
+            #pragma omp for
+            for (int i=0; i < P; i++) {
+                pkg_states[i].pos = next_pos[i];
+            }
+
+            // reset global undelivered
             #pragma omp single
             {
-                pos.swap(next_pos);
                 undelivered = 0;
             }
 
@@ -568,12 +573,12 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
             // ensure undelivered is fully updated before continuing to next step
             #pragma omp barrier
 
-            // rebuild local_pkgs[tid] from incoming messages
-            pkgs.clear();
+            // rebuild local_ids[tid] from incoming messages
+            local_ids.clear();
             for (int src=0; src < T; src++) {
                 auto &incoming = thread_outgoing[src][tid];
                 if (!incoming.empty())
-                    pkgs.insert(pkgs.end(), incoming.begin(), incoming.end());
+                    local_ids.insert(local_ids.end(), incoming.begin(), incoming.end());
             }
 
             // barrier so everyone has finished reading from thread_outgoing
