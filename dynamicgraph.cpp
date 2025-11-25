@@ -13,7 +13,6 @@
 
 #include <omp.h>
 
-
 DynamicGraph::DynamicGraph(std::size_t num_vertices)
     : adj_(num_vertices),
       snapshot_adj_(),
@@ -166,18 +165,22 @@ DynamicGraph::min_cost_routing(const std::vector<std::pair<Vertex, Vertex>>& pai
         }
     }
 
-    auto get_dist = [&](Vertex v, Vertex d) -> int {
+    // precompute destination index for each package
+    std::vector<int> pkg_dest_idx(P, -1);
+    // TODO: maybe add parallel region
+    for (int i=0; i < P; i++) {
+        Vertex d = pairs[i].second;
         auto it = dest_index.find(d);
-        if (it == dest_index.end())
-            return INF;
-        int idx = it->second;
-        return dist_to_dest[idx][v];
-    };
+        if (it != dest_index.end())
+            pkg_dest_idx[i] = it->second;  // index into dist_to_dest
+        else
+            pkg_dest_idx[i] = -1; // unreachable
+    }
 
     // initialize package state
     std::vector<Vertex> pos(P); // current position
     std::vector<Vertex> dst(P); // destination
-    std::vector<bool> done(P, false);
+    std::vector<uint8_t> done(P, false);
     std::vector<std::vector<Vertex>> paths(P);
 
     for (int i=0; i < P; i++) {
@@ -185,7 +188,7 @@ DynamicGraph::min_cost_routing(const std::vector<std::pair<Vertex, Vertex>>& pai
         Vertex d = pairs[i].second;
 
         if (s < 0 || d < 0 || static_cast<std::size_t>(s) >= n || static_cast<std::size_t>(d) >= n || !active_[s] || !active_[d]) {
-            done[i] = true;
+            done[i] = 1;
             (*arrival_time)[i] = -1;
             continue;
         }
@@ -194,7 +197,7 @@ DynamicGraph::min_cost_routing(const std::vector<std::pair<Vertex, Vertex>>& pai
         dst[i] = d;
         paths[i].push_back(s);
         if (s == d) {
-            done[i] = true;
+            done[i] = 1;
             (*arrival_time)[i] = 0;
         }
     }
@@ -223,11 +226,16 @@ DynamicGraph::min_cost_routing(const std::vector<std::pair<Vertex, Vertex>>& pai
             }
 
             Vertex u = pos[i];
-            Vertex d = dst[i];
-
-            int best_dist = get_dist(u, d);
+            int d_idx = pkg_dest_idx[i];
+            int best_dist;
             Vertex best_v = u;
+    
+            if (d_idx < 0) { // destination unreachable
+                desired_next[i] = u;
+                continue;
+            }
 
+            best_dist = dist_to_dest[d_idx][u];
             if (best_dist == INF) {
                 desired_next[i] = u;
                 continue;
@@ -235,21 +243,21 @@ DynamicGraph::min_cost_routing(const std::vector<std::pair<Vertex, Vertex>>& pai
 
             for (const Edge &e : G[u]) {
                 Vertex v = e.to;
-                if (!active_[v]) 
+                if (!active_[v])
                     continue;
-                int dv = get_dist(v, d);
+                int dv = dist_to_dest[d_idx][v];
                 if (dv < best_dist) {
                     best_dist = dv;
                     best_v = v;
                 }
             }
-            desired_next[i] = best_v;
+            desired_next[i] = best_v;    
         }
 
         // edge capacity constraint
         std::unordered_map<std::uint64_t, int> edge_owner;
         edge_owner.reserve(2*P);
-        std::vector<bool> can_move(P, false);
+        std::vector<uint8_t> can_move(P, false);
 
         for (int i=0; i < P; i++) {
             if (done[i]) 
@@ -265,10 +273,10 @@ DynamicGraph::min_cost_routing(const std::vector<std::pair<Vertex, Vertex>>& pai
             auto it = edge_owner.find(key);
             if (it == edge_owner.end()) {
                 edge_owner.emplace(key, i);
-                can_move[i] = true;
+                can_move[i] = 1;
             } 
             else
-                can_move[i] = false;
+                can_move[i] = 0;
         }
 
         // commit moves and update state in parallel
@@ -294,7 +302,7 @@ DynamicGraph::min_cost_routing(const std::vector<std::pair<Vertex, Vertex>>& pai
                 next_pos[i] = pos[i];
 
             if (next_pos[i] == dst[i]) {
-                done[i] = true;
+                done[i] = 1;
                 (*arrival_time)[i] = t+1;
             }
 
@@ -367,33 +375,32 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
         }
     }
 
-    auto get_dist = [&](Vertex v, Vertex d) -> int {
+    // precompute destination index per package
+    std::vector<int> pkg_dest_idx(P, -1);
+    for (int i=0; i < P; i++) {
+        Vertex d = pairs[i].second;
         auto it = dest_index.find(d);
-        if (it == dest_index.end())
-            return INF;
-        int idx = it->second;
-        return dist_to_dest[idx][v];
-    };
+        if (it != dest_index.end())
+            pkg_dest_idx[i] = it->second;
+        else
+            pkg_dest_idx[i] = -1; // unreachable
+    }
 
     // initialize package states
     std::vector<Vertex> pos(P);
     std::vector<Vertex> dst(P);
-    std::vector<bool> done(P, false);
+    std::vector<uint8_t> done(P, false);
     std::vector<std::vector<Vertex>> paths(P);
 
     if (arrival_time)
         arrival_time->assign(P, -1);
 
-    for (int i = 0; i < P; i++) {
+    for (int i=0; i < P; i++) {
         Vertex s = pairs[i].first;
         Vertex d = pairs[i].second;
 
-        if (s < 0 || d < 0 ||
-            static_cast<std::size_t>(s) >= n ||
-            static_cast<std::size_t>(d) >= n ||
-            !active_[s] || !active_[d]) {
-
-            done[i] = true;
+        if (s < 0 || d < 0 || static_cast<std::size_t>(s) >= n || static_cast<std::size_t>(d) >= n || !active_[s] || !active_[d]) {
+            done[i] = 1;
             if (arrival_time)
                 (*arrival_time)[i] = -1;
             continue;
@@ -404,14 +411,14 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
         paths[i].push_back(s);
 
         if (s == d) {
-            done[i] = true;
+            done[i] = 1;
             if (arrival_time)
                 (*arrival_time)[i] = 0;
         }
     }
 
     int undelivered = 0;
-    for (int i = 0; i < P; i++) {
+    for (int i=0; i < P; i++) {
         if (!done[i])
             undelivered++;
     }
@@ -461,7 +468,7 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
             std::unordered_map<std::uint64_t, int> edge_owner;
             edge_owner.reserve(2*pkgs.size() + 1);
 
-            std::vector<bool> local_can_move(pkgs.size(), false);
+            std::vector<uint8_t> local_can_move(pkgs.size(), false);
             std::vector<Vertex> desired_next_local(pkgs.size(), -1);
 
             int local_undelivered = 0;
@@ -474,17 +481,24 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
                 }
 
                 Vertex u = pos[i];
-                Vertex d = dst[i];
+                int d_idx = pkg_dest_idx[i];
 
-                int best_dist = get_dist(u, d);
                 Vertex best_v = u;
+                int best_dist;
+
+                if (d_idx < 0) { // unreachable destination
+                    desired_next_local[idx] = u;
+                    continue;
+                }
+
+                best_dist = dist_to_dest[d_idx][u];
 
                 if (best_dist != INF) {
                     for (const Edge &e : G[u]) {
                         Vertex v = e.to;
-                        if (!active_[v]) 
+                        if (!active_[v])
                             continue;
-                        int dv = get_dist(v, d);
+                        int dv = dist_to_dest[d_idx][v];
                         if (dv < best_dist) {
                             best_dist = dv;
                             best_v = v;
@@ -493,6 +507,7 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
                 }
 
                 desired_next_local[idx] = best_v;
+
                 // capacity resolution for edges whose sources are in this partition
                 if (!done[i]) {
                     Vertex v = best_v;
@@ -501,7 +516,7 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
                         auto it = edge_owner.find(key);
                         if (it == edge_owner.end()) {
                             edge_owner.emplace(key, i);
-                            local_can_move[idx] = true;
+                            local_can_move[idx] = 1;
                         }
                     }
                 }
@@ -525,7 +540,7 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
                     next_pos[i] = pos[i];
 
                 if (next_pos[i] == dst[i]) {
-                    done[i] = true;
+                    done[i] = 1;
                     if (arrival_time)
                         (*arrival_time)[i] = t_step + 1;
                 }
@@ -536,7 +551,6 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
                     local_undelivered++;
                 }
             }
-
             // synchronize so all next_pos and outgoing are written
             #pragma omp barrier
 
@@ -634,18 +648,21 @@ DynamicGraph::min_cost_routing_edge_parallel(const std::vector<std::pair<Vertex,
         }
     }
 
-    auto get_dist = [&](Vertex v, Vertex d) -> int {
+    // precompute destination index per package
+    std::vector<int> pkg_dest_idx(P, -1);
+    for (int i=0; i < P; i++) {
+        Vertex d = pairs[i].second;
         auto it = dest_index.find(d);
-        if (it == dest_index.end())
-            return INF;
-        int idx = it->second;
-        return dist_to_dest[idx][v];
-    };
+        if (it != dest_index.end())
+            pkg_dest_idx[i] = it->second;
+        else
+            pkg_dest_idx[i] = -1; // unreachable
+    }
 
     // initialize package state
     std::vector<Vertex> pos(P); // current position
     std::vector<Vertex> dst(P); // destination
-    std::vector<bool> done(P, false);
+    std::vector<uint8_t> done(P, false);
     std::vector<std::vector<Vertex>> paths(P);
 
     for (int i=0; i < P; i++) {
@@ -653,7 +670,7 @@ DynamicGraph::min_cost_routing_edge_parallel(const std::vector<std::pair<Vertex,
         Vertex d = pairs[i].second;
 
         if (s < 0 || d < 0 || static_cast<std::size_t>(s) >= n || static_cast<std::size_t>(d) >= n || !active_[s] || !active_[d]) {
-            done[i] = true;
+            done[i] = 1;
             (*arrival_time)[i] = -1;
             continue;
         }
@@ -662,7 +679,7 @@ DynamicGraph::min_cost_routing_edge_parallel(const std::vector<std::pair<Vertex,
         dst[i] = d;
         paths[i].push_back(s);
         if (s == d) {
-            done[i] = true;
+            done[i] = 1;
             (*arrival_time)[i] = 0;
         }
     }
@@ -690,7 +707,6 @@ DynamicGraph::min_cost_routing_edge_parallel(const std::vector<std::pair<Vertex,
         return static_cast<int>(2 * static_cast<std::size_t>(eid) + (forward ? 0 : 1));
     };
 
-
     // simulation
     for (int t=0; t < max_steps && undelivered > 0; t++) {
         std::vector<Vertex> desired_next(P, -1);
@@ -701,22 +717,30 @@ DynamicGraph::min_cost_routing_edge_parallel(const std::vector<std::pair<Vertex,
         for (int i=0; i < P; i++) {
             if (done[i]) {
                 desired_next[i] = pos[i];
-                desired_eid[i]  = -1;
+                desired_eid[i] = -1;
                 continue;
             }
 
             Vertex u = pos[i];
-            Vertex d = dst[i];
-
-            int best_dist = get_dist(u, d);
+            int d_idx = pkg_dest_idx[i];
             Vertex best_v = u;
             EdgeId best_edge = -1;
+            int best_dist;
+
+            if (d_idx < 0) { // unreachable destination
+                desired_next[i] = u;
+                desired_eid[i]  = -1;
+                continue;
+            }
+
+            best_dist = dist_to_dest[d_idx][u];
 
             if (best_dist != INF) {
                 for (const Edge &e : G[u]) {
                     Vertex v = e.to;
-                    if (!active_[v]) continue;
-                    int dv = get_dist(v, d);
+                    if (!active_[v]) 
+                        continue;
+                    int dv = dist_to_dest[d_idx][v];
                     if (dv < best_dist) {
                         best_dist = dv;
                         best_v = v;
@@ -804,7 +828,7 @@ DynamicGraph::min_cost_routing_edge_parallel(const std::vector<std::pair<Vertex,
                 next_pos[i] = pos[i];
 
             if (next_pos[i] == dst[i]) {
-                done[i] = true;
+                done[i] = 1;
                 (*arrival_time)[i] = t+1;
             }
 
