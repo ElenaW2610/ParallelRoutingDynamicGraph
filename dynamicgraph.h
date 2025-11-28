@@ -42,5 +42,4 @@ class DynamicGraph {
         std::vector<bool> active_;
     
         std::vector<int> edge_capacity_; 
-    };
-    
+};

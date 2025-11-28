@@ -110,7 +110,7 @@ static inline std::uint64_t pack_edge_key(int u, int v) {
     return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(u)) << 32) | static_cast<std::uint32_t>(v);
 }
 
-// Multiple Packages Routing Simulation (parallel via dynamic scheduling)
+// Multiple Packages Routing Simulation (parallel)
 std::vector<std::vector<DynamicGraph::Vertex>>
 DynamicGraph::min_cost_routing(const std::vector<std::pair<Vertex, Vertex>>& pairs, std::vector<int>* arrival_time, int max_steps) const 
 {
@@ -428,11 +428,16 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
 
     std::vector<Vertex> next_pos(P);
 
-    // partition vertices into subgraphs (round-robin)
     int T = omp_get_max_threads();
     if (T <= 0)
         T = 1;
 
+    // // block
+    // auto vertex_partition = [T, n](Vertex v) -> int {
+    //     return static_cast<int>(v / ((n + T - 1) / T)); 
+    // };
+
+    // cyclic
     auto vertex_partition = [T](Vertex v) -> int {
         return static_cast<int>(v % T);
     };
@@ -850,165 +855,152 @@ DynamicGraph::min_cost_routing_edge_parallel(const std::vector<std::pair<Vertex,
     return paths;
 }
 
-std::vector<std::vector<DynamicGraph::Vertex>>
-DynamicGraph::min_cost_routing_auto(const std::vector<std::pair<Vertex, Vertex>>& pairs, std::vector<int>* arrival_time, int max_steps) const
-{
-    const auto &G = snapshot_adj_.empty() ? adj_ : snapshot_adj_;
-    std::size_t n = G.size();
-    int P = static_cast<int>(pairs.size());
-
-    if (arrival_time)
-        arrival_time->assign(P, -1);
-
-    if (P == 0)
-        return {};
-
-    int T = omp_get_max_threads();
-
-    long long directed_edges = 0;
-    for (std::size_t v=0; v < n; v++) {
-        if (!active_[v]) 
-            continue;
-        directed_edges += static_cast<long long>(G[v].size());
-    }
-    long long E = directed_edges / 2;
-
-    if (E == 0)
-        return min_cost_routing_edge_parallel(pairs, arrival_time, max_steps);
-
-    double avg_deg = directed_edges / static_cast<double>(n); // 2E / N
-    double rho = static_cast<double>(P) / static_cast<double>(E);  // pkgs per edge
-    double rho_eff = rho * T; // pkgs per edge per thread
-
-    // dynamic congestion estimate at sources; sample up to 1000 packages
-    int sample = std::min(P, 1000);
-    long long total_deg = 0;
-    int used = 0;
-    if (sample > 0) {
-        int stride = std::max(1, P / sample);
-        for (int k=0, idx=0; k < sample && idx < P; k++, idx += stride) {
-            Vertex u = pairs[idx].first;
-            Vertex d = pairs[idx].second;
-            if (u == d) 
-                continue;
-            if (u < 0 || static_cast<std::size_t>(u) >= n) 
-                continue;
-            if (!active_[u]) 
-                continue;
-            total_deg += static_cast<int>(G[u].size());
-            used++;
-        }
-    }
-
-    // capacity per package ~ average outgoing degree of vertices where packages live
-    double capacity_per_pkg = (used > 0) ? (static_cast<double>(total_deg) / used) : avg_deg;
-
-    // heuristic decision between partitioned and edge-parallel
-    const double SPARSE_DEGREE_THRESH = 8.0; // very sparse
-    const double DENSE_DEGREE_THRESH = 512.0; // very dense
-    const double LOW_LOAD_PER_EDGE_THREAD = 0.05; // low contention
-    const double FUNNEL_CAPACITY_PER_PKG = 2.0; // funnel
-
-    bool use_partitioned = false;
-    if (avg_deg <= SPARSE_DEGREE_THRESH) // line / tree-like
-        use_partitioned = false;
-    else {
-        bool funnel_like = (capacity_per_pkg < FUNNEL_CAPACITY_PER_PKG);
-        bool moderate_load = (rho_eff >= LOW_LOAD_PER_EDGE_THREAD);
-        if (funnel_like && moderate_load)
-            use_partitioned = true;
-        else if (avg_deg >= DENSE_DEGREE_THRESH && moderate_load)
-            use_partitioned = true;
-        else
-            use_partitioned = false;
-    }
-
-    if (use_partitioned) {
-        std::cout << "Use graph partition scheme\n" << std::flush;
-        return min_cost_routing_partitioned(pairs, arrival_time, max_steps);
-    }
-    std::cout << "Use edge parallel scheme\n" << std::flush;
-    return min_cost_routing_edge_parallel(pairs, arrival_time, max_steps);
-}
-
-// K-cores (parallel with static scheduling)
+// K-cores (parallel)
 std::vector<int> DynamicGraph::k_core(int k) const {
     const auto &G = snapshot_adj_.empty() ? adj_ : snapshot_adj_;
     std::size_t n = G.size();
-    std::vector<int> degree(n, 0);
-    std::vector<bool> alive(n, false);
 
-    // degree initialization
-    #pragma omp parallel for
-    for (long long v=0; v < (long long)n; v++) {
+    std::vector<uint8_t> alive(n, 0); 
+    std::vector<int> degree(n, 0);
+
+    // degree computation and initialization
+    #pragma omp parallel for schedule(static)
+    for (long long v = 0; v < (long long)n; v++) {
         if (!active_[v]) {
             degree[v] = 0;
-            alive[v] = false;
             continue;
         }
 
-        alive[v] = true;
+        alive[v] = 1;
         int d = 0;
         for (const Edge &e : G[v]) {
             Vertex u = e.to;
-            if (active_[u])
+            if (active_[u]) 
                 d++;
         }
         degree[v] = d;
     }
 
-    // frontier initialization
-    std::vector<Vertex> frontier;
+    // parallel frontier initialization
+    std::vector<int> frontier;
     frontier.reserve(n);
+    int num_threads = omp_get_max_threads();
+    std::vector<std::vector<int>> thread_buffers(num_threads);
 
-    for (Vertex v = 0; v < (Vertex)n; v++) {
-        if (alive[v] && degree[v] < k)
-            frontier.push_back(v);
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        thread_buffers[tid].reserve(n / num_threads); 
+
+        #pragma omp for schedule(static) nowait
+        for (long long v = 0; v < (long long)n; v++) {
+            if (alive[v] && degree[v] < k)
+                thread_buffers[tid].push_back(v);
+        }
     }
 
-    // iteratively decrement frontier degrees
+    // parallel flatten thread_buffers into frontier using prefix sums
+    frontier.clear();
+    // compute offsets
+    std::vector<std::size_t> offsets(num_threads+1, 0);
+    for (int t=0; t < num_threads; t++)
+        offsets[t+1] = offsets[t] + thread_buffers[t].size();
+
+    // allocate exact size
+    frontier.resize(offsets[num_threads]);
+
+    // parallel copy
+    #pragma omp parallel for schedule(static)
+    for (int t=0; t < num_threads; t++) {
+        const auto &buf = thread_buffers[t];
+        if (!buf.empty())
+            std::copy(buf.begin(), buf.end(), frontier.begin()+offsets[t]);
+    }
+
+    std::vector<int> next_frontier;
+    next_frontier.reserve(n);
+    // iteratively peel layers
     while (!frontier.empty()) {
-        std::vector<Vertex> next_frontier;
-        next_frontier.reserve(frontier.size());
+        // reset global counter for next frontier
+        std::atomic<int> next_frontier_count(0);
+        #pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            thread_buffers[tid].clear(); 
+
+            // degree distribution is usually skewed under the power law, use guided scheduling
+            #pragma omp for schedule(guided)
+            for (long long i = 0; i < (long long)frontier.size(); i++) {
+                Vertex v = frontier[i];
+                alive[v] = 0; 
+
+                for (const Edge &e : G[v]) {
+                    Vertex u = e.to;
+                    if (alive[u] && degree[u] >= k) { 
+                        int prev_deg;
+                        // atomic decrement
+                        #pragma omp atomic capture
+                        prev_deg = degree[u]--;
+
+                        if (prev_deg == k)
+                            thread_buffers[tid].push_back(u);
+                    }
+                }   
+            }
+        }
+
+        // parallel flattening with lock-free write
+        std::vector<int> offsets(num_threads + 1, 0);
+        for(int i=0; i<num_threads; ++i) {
+            offsets[i+1] = offsets[i] + thread_buffers[i].size();
+        }
+        
+        int total_new_nodes = offsets[num_threads];
+        next_frontier.resize(total_new_nodes);
 
         #pragma omp parallel
         {
-            std::vector<Vertex> local_next;
-
-            #pragma omp for nowait
-            for (long long i=0; i < (long long)frontier.size(); i++) {
-                Vertex v = frontier[i];
-                if (!alive[v]) 
-                    continue;
-                alive[v] = false;
-
-                // decrement degree of neighbors
-                for (const Edge &e : G[v]) {
-                    Vertex u = e.to;
-                    if (!alive[u]) 
-                        continue;
-
-                    int newdeg;
-                    #pragma omp atomic capture
-                    newdeg = --degree[u];
-
-                    if (newdeg == k-1)
-                        local_next.push_back(u);
-                }
-            }
-
-            #pragma omp critical
-            next_frontier.insert(next_frontier.end(), local_next.begin(), local_next.end());
+            int tid = omp_get_thread_num();
+            int start = offsets[tid];
+            int size = thread_buffers[tid].size();
+            if (size > 0)
+                std::copy(thread_buffers[tid].begin(), thread_buffers[tid].end(), next_frontier.begin()+start);
         }
 
+        // swap buffers for next iteration
         frontier.swap(next_frontier);
     }
 
-    // collect remaining vertices
+    // collect results in parallel
+    // clear thread_buffers from the last iteration
+    for (int t=0; t < num_threads; t++)
+        thread_buffers[t].clear();
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        auto &buf = thread_buffers[tid];
+        buf.reserve(n/num_threads + 1);
+
+        #pragma omp for schedule(static)
+        for (long long v=0; v < (long long)n; v++) {
+            if (alive[v])
+                buf.push_back(static_cast<int>(v));
+        }
+    }
+
+    // prefix sum offsets
+    std::vector<std::size_t> result_offsets(num_threads + 1, 0);
+    for (int t=0; t < num_threads; t++)
+    result_offsets[t+1] = result_offsets[t] + thread_buffers[t].size();
+
     std::vector<int> result;
-    for (Vertex v=0; v < (Vertex)n; v++) {
-        if (alive[v]) 
-            result.push_back(v);
+    result.resize(result_offsets[num_threads]);
+    #pragma omp parallel for schedule(static)
+    for (int t=0; t < num_threads; t++) {
+        const auto &buf = thread_buffers[t];
+        if (!buf.empty())
+            std::copy(buf.begin(), buf.end(), result.begin()+result_offsets[t]);
     }
 
     return result;
