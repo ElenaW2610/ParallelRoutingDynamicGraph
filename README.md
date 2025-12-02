@@ -1,7 +1,7 @@
 # ParallelRoutingDynamicGraph
 
 ## Project Overview
-Please refer to this doc for what this project is about: https://docs.google.com/document/d/1oxg-tKCexYw8OshllP46ZXYg4PcXCuVVvzN8hx8QYuI/
+Please refer to this doc for what this project is about: https://docs.google.com/document/d/1oxg-tKCexYw8OshllP46ZXYg4PcXCuVVvzN8hx8QYuI/](https://docs.google.com/document/d/1fJGb3wdToGd9lI4-tq156Pgj-uxjkK_7oeaf3CegNPs/
 
 ## How to run
 Run `make` to compile the dynamicgraph.o library and all test cases in the `./test` directory.
