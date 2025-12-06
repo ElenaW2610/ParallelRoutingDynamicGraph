@@ -24,7 +24,8 @@ struct PackageState {
 DynamicGraph::DynamicGraph(std::size_t num_vertices)
     : adj_(num_vertices),
       snapshot_adj_(),
-      active_(num_vertices, true) {}
+      active_(num_vertices, true), 
+      total_edges_(0) {}
 
 static inline void 
 check_vertex(const DynamicGraph::Vertex v, std::size_t n) {
@@ -39,7 +40,7 @@ void DynamicGraph::add_vertex(Vertex v) {
     if (id >= adj_.size()) {
         adj_.resize(id+1);
         snapshot_adj_.resize(id+1);
-        active_.resize(id + 1, false);
+        active_.resize(id+1, false);
     }
     active_[id] = true;
 }
@@ -49,14 +50,14 @@ void DynamicGraph::remove_vertex(Vertex v) {
     active_[v] = false;
 }
 
-void DynamicGraph::add_edge(Vertex u, Vertex v, int capacity) {
+void DynamicGraph::add_edge(Vertex u, Vertex v) {
     std::size_t n = adj_.size();
     check_vertex(u, n);
     check_vertex(v, n);
-    if (!active_[u] || !active_[v]) return;
+    if (!active_[u] || !active_[v]) 
+        return;
 
-    EdgeId id_uv = static_cast<EdgeId>(edge_capacity_.size());
-    edge_capacity_.push_back(capacity);
+    EdgeId id_uv = static_cast<EdgeId>(total_edges_++);
 
     Edge e1{v, id_uv};
     Edge e2{u, id_uv};
@@ -170,7 +171,7 @@ DynamicGraph::min_cost_routing(const std::vector<std::pair<Vertex, Vertex>>& pai
 
     // precompute destination index for each package
     std::vector<int> pkg_dest_idx(P, -1);
-    // TODO: maybe add parallel region
+    #pragma omp parallel for schedule(static)
     for (int i=0; i < P; i++) {
         Vertex d = pairs[i].second;
         auto it = dest_index.find(d);
@@ -385,6 +386,7 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
     if (arrival_time)
         arrival_time->assign(P, -1);
     
+    // initialization of package states
     for (int i=0; i < P; i++) {
         Vertex s = pairs[i].first;
         Vertex d = pairs[i].second;
@@ -408,6 +410,7 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
         }
     
         pkg_states[i].pos = s;
+        paths[i].reserve(std::min(max_steps, 128));
         paths[i].push_back(s);
     
         if (s == d) {
@@ -660,6 +663,7 @@ DynamicGraph::min_cost_routing_edge_parallel(const std::vector<std::pair<Vertex,
 
     // precompute destination index per package
     std::vector<int> pkg_dest_idx(P, -1);
+    #pragma omp parallel for schedule(static)
     for (int i=0; i < P; i++) {
         Vertex d = pairs[i].second;
         auto it = dest_index.find(d);
@@ -706,7 +710,7 @@ DynamicGraph::min_cost_routing_edge_parallel(const std::vector<std::pair<Vertex,
     std::vector<Vertex> next_pos(P);
 
     // per-directed-edge owner slots, 2 slots per undirected edge
-    std::size_t E = edge_capacity_.size();
+    std::size_t E = total_edges_;
     std::vector<std::atomic<int>> edge_owner(2 * E);
     #pragma omp parallel for schedule(static)
     for (long long i = 0; i < (long long)edge_owner.size(); i++) {
@@ -950,10 +954,9 @@ std::vector<int> DynamicGraph::k_core(int k) const {
         }
 
         // parallel flattening with lock-free write
-        std::vector<int> offsets(num_threads + 1, 0);
-        for(int i=0; i<num_threads; ++i) {
+        std::vector<int> offsets(num_threads+1, 0);
+        for(int i=0; i<num_threads; i++)
             offsets[i+1] = offsets[i] + thread_buffers[i].size();
-        }
         
         int total_new_nodes = offsets[num_threads];
         next_frontier.resize(total_new_nodes);

@@ -9,7 +9,7 @@ class DynamicGraph {
     
         explicit DynamicGraph(std::size_t num_vertices);
     
-        void add_edge(Vertex u, Vertex v, int capacity = 1);
+        void add_edge(Vertex u, Vertex v);
         void remove_edge(Vertex u, Vertex v);
         void add_vertex(Vertex v);
         void remove_vertex(Vertex v);
@@ -40,6 +40,5 @@ class DynamicGraph {
         std::vector<std::vector<Edge>> adj_;
         std::vector<std::vector<Edge>> snapshot_adj_; // snapshot adjacency
         std::vector<bool> active_;
-    
-        std::vector<int> edge_capacity_; 
+        std::size_t total_edges_ = 0;
 };
