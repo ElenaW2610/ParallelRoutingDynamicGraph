@@ -429,8 +429,6 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
     if (undelivered == 0)
         return paths;
 
-    std::vector<Vertex> next_pos(P);
-
     int T = omp_get_max_threads();
     if (T <= 0)
         T = 1;
@@ -534,39 +532,33 @@ DynamicGraph::min_cost_routing_partitioned(const std::vector<std::pair<Vertex, V
                 int i = local_ids[idx];
                 PackageState &p = pkg_states[i];
 
-                if (p.done) {
-                    next_pos[i] = p.pos;
-                    continue;
-                }
-
-                if (local_can_move[idx]) {
-                    next_pos[i] = desired_next_local[idx];
-                    if (paths[i].empty() || paths[i].back() != next_pos[i])
-                        paths[i].push_back(next_pos[i]);
+                Vertex next_v;
+                if (p.done)
+                    next_v = p.pos; // should not happen, but for safety
+                else if (local_can_move[idx]) {
+                    next_v = desired_next_local[idx];
+                    if (paths[i].empty() || paths[i].back() != next_v)
+                        paths[i].push_back(next_v);
                 } 
                 else
-                    next_pos[i] = p.pos;
+                    next_v = p.pos;
 
-                if (next_pos[i] == p.dst) {
+                p.pos = next_v;
+
+                if (next_v == p.dst) {
                     p.done = 1;
                     if (arrival_time)
                         (*arrival_time)[i] = t_step+1;
                 }
 
                 if (!p.done) {
-                    int next_part = vertex_partition(next_pos[i]);
+                    int next_part = vertex_partition(next_v);
                     out_row[next_part].push_back(i);
                     local_undelivered++;
                 }
             }
-            // synchronize so all next_pos and outgoing are written
+            // synchronize so all next_v and outgoing are written
             #pragma omp barrier
-
-            // update pkg_states[i].pos from next_pos in parallel
-            #pragma omp for
-            for (int i=0; i < P; i++) {
-                pkg_states[i].pos = next_pos[i];
-            }
 
             // reset global undelivered
             #pragma omp single
